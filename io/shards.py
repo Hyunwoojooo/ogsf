@@ -74,11 +74,30 @@ def _serialize_sample(sample: Mapping[str, object], index: int) -> Dict[str, byt
     np.save(text_buffer, text, allow_pickle=False)
     text_bytes = text_buffer.getvalue()
 
-    return {
+    payloads: Dict[str, bytes] = {
         f"{base_name}/meta.json": meta_bytes,
         f"{base_name}/video.npy": video_bytes,
         f"{base_name}/text.npy": text_bytes,
     }
+
+    object_feat = sample.get("object_feat")
+    if object_feat is not None:
+        obj_array = _to_array(object_feat)  # type: ignore[arg-type]
+        meta["object_feat_shape"] = list(obj_array.shape)
+        object_buffer = io.BytesIO()
+        np.save(object_buffer, obj_array.astype(np.float32), allow_pickle=False)
+        payloads[f"{base_name}/objects.npy"] = object_buffer.getvalue()
+
+    object_mask = sample.get("object_mask")
+    if object_mask is not None:
+        mask_array = np.asarray(object_mask, dtype=np.float32).reshape(-1)
+        meta["object_mask_shape"] = [int(mask_array.shape[0])]
+        mask_buffer = io.BytesIO()
+        np.save(mask_buffer, mask_array, allow_pickle=False)
+        payloads[f"{base_name}/object_mask.npy"] = mask_buffer.getvalue()
+
+    payloads[f"{base_name}/meta.json"] = json.dumps(meta, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return payloads
 
 
 def write_shards(
@@ -193,15 +212,25 @@ def read_shard(path: str | Path) -> List[schema.NLQSample]:
         video = np.load(io.BytesIO(bundle["video.npy"]))
         text = np.load(io.BytesIO(bundle["text.npy"]))
 
-        restored = schema.NLQSample(
-            video_id=str(meta["video_id"]),
-            qid=str(meta["qid"]),
-            video_feat=video.astype(np.float32).tolist(),
-            text_feat=text.astype(np.float32).tolist(),
-            labels=[{"start": float(lbl["start"]), "end": float(lbl["end"])} for lbl in meta["labels"]],
-            fps=float(meta["fps"]),
+        restored: Dict[str, object] = dict(
+            schema.NLQSample(
+                video_id=str(meta["video_id"]),
+                qid=str(meta["qid"]),
+                video_feat=video.astype(np.float32).tolist(),
+                text_feat=text.astype(np.float32).tolist(),
+                labels=[{"start": float(lbl["start"]), "end": float(lbl["end"])} for lbl in meta["labels"]],
+                fps=float(meta["fps"]),
+            )
         )
-        result.append(restored)
+
+        if "objects.npy" in bundle:
+            object_feat = np.load(io.BytesIO(bundle["objects.npy"]))
+            restored["object_feat"] = object_feat.astype(np.float32).tolist()
+        if "object_mask.npy" in bundle:
+            object_mask = np.load(io.BytesIO(bundle["object_mask.npy"]))
+            restored["object_mask"] = object_mask.astype(np.float32).tolist()
+
+        result.append(restored)  # type: ignore[arg-type]
 
     return result
 

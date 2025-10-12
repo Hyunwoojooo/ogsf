@@ -1,2 +1,29 @@
-# OGSF model experiment configuration placeholder.
-# TODO: Define NLQ OGSF training configuration values.
+data:
+  train_glob: "${WDS_SHARDS}/train/*.tar"
+  val_glob: "${WDS_SHARDS}/val/*.tar"
+  shuffle_buf: 256
+  sequence_length: 64
+  text_tokens: 16
+
+model:
+  name: ogsf
+  d_v: 512
+  d_t: 512
+  hidden: 256
+  heads: 4
+  num_layers: 2
+  dropout: 0.1
+  use_objects: true
+  object_dim: 4
+  use_multiscale: true
+  use_asl: true
+  use_flash_attn: false
+
+solver:
+  batch_size: 4
+  lr: 2.0e-4
+  epochs: 1
+  fp16: false
+  sequence_length: 64
+
+runtime: {}

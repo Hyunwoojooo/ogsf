@@ -56,11 +56,25 @@ def _map_sample(sample: schema.NLQSample, *, pin_memory: bool) -> Dict[str, Any]
         "fps": float(sample["fps"]),
     }
 
+    object_feat = sample.get("object_feat")
+    if object_feat is not None:
+        obj = np.asarray(object_feat, dtype=np.float32)
+        record["object_feat"] = obj
+        object_mask = sample.get("object_mask")
+        if object_mask is not None:
+            mask = np.asarray(object_mask, dtype=np.float32).reshape(-1)
+        else:
+            mask = (obj[..., 0] > 0).astype(np.float32)
+        record["object_mask"] = mask
+
     if pin_memory:
         if torch is None:
             raise RuntimeError("pin_memory requested but torch is not available")
         record["video_feat"] = torch.from_numpy(video).pin_memory()
         record["text_feat"] = torch.from_numpy(text).pin_memory()
+        if "object_feat" in record:
+            record["object_feat"] = torch.from_numpy(record["object_feat"]).pin_memory()
+            record["object_mask"] = torch.from_numpy(record["object_mask"]).pin_memory()
 
     return record
 

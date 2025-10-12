@@ -6,11 +6,14 @@ import argparse
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, Mapping, MutableMapping
+from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional
 
+import numpy as np
 import torch
 
 from ..common import config as config_utils
+from ..features import video_loader
+from ..io import webdataset_reader
 from ..models import MVPConfig, MVPModel, OGSFConfig, OGSFModel
 from ..train import amp, loop, optimizer
 
@@ -106,6 +109,175 @@ def _build_model(model_cfg: Mapping[str, Any]) -> torch.nn.Module:
     raise ValueError(f"Unsupported model name: {name}")
 
 
+def _expand_path(value: str | None) -> Optional[str]:
+    if not value:
+        return None
+    return os.path.expandvars(os.path.expanduser(value))
+
+
+def _prepare_sample_batch(
+    batch: List[Mapping[str, Any]],
+    *,
+    sequence_length: int,
+    text_tokens: int,
+) -> Dict[str, Any]:
+    """Convert a list of raw samples into stacked tensors."""
+
+    if sequence_length <= 0:
+        raise ValueError("sequence_length must be positive")
+    if text_tokens <= 0:
+        raise ValueError("text_tokens must be positive")
+
+    video_tensors: List[torch.Tensor] = []
+    text_tensors: List[torch.Tensor] = []
+    score_targets: List[torch.Tensor] = []
+    bound_targets: List[torch.Tensor] = []
+    masks: List[torch.Tensor] = []
+    metadata: List[Dict[str, Any]] = []
+    object_features: List[Optional[torch.Tensor]] = []
+    object_masks: List[Optional[torch.Tensor]] = []
+    object_feature_dim: Optional[int] = None
+    has_objects = False
+
+    denom = max(sequence_length - 1, 1)
+
+    for sample in batch:
+        video_raw = np.asarray(sample["video_feat"], dtype=np.float32)
+        if video_raw.ndim == 1:
+            video_raw = video_raw.reshape(1, -1)
+        video_seq, mask = video_loader.prepare_feature_sequence(
+            video_raw,
+            target_length=sequence_length,
+            normalize=True,
+        )
+        video_tensors.append(torch.from_numpy(video_seq))
+        masks.append(torch.from_numpy(mask))
+
+        text_raw = np.asarray(sample["text_feat"], dtype=np.float32)
+        if text_raw.ndim == 1:
+            text_raw = text_raw.reshape(1, -1)
+        text_seq, _ = video_loader.prepare_feature_sequence(
+            text_raw,
+            target_length=text_tokens,
+            normalize=False,
+        )
+        text_tensors.append(torch.from_numpy(text_seq))
+
+        labels = sample.get("labels") or [{"start": 0.0, "end": 0.0}]
+        start_sec = float(labels[0]["start"])
+        end_sec = float(labels[0]["end"])
+        if end_sec < start_sec:
+            end_sec = start_sec
+        duration = max(max(label["end"] for label in labels), 1e-3)
+        start_frac = max(0.0, min(1.0, start_sec / duration))
+        end_frac = max(start_frac, min(1.0, end_sec / duration))
+        start_idx = int(round(start_frac * denom))
+        end_idx = int(round(end_frac * denom))
+
+        scores = torch.zeros(sequence_length, dtype=torch.float32)
+        scores[start_idx : end_idx + 1] = 1.0
+        bounds = torch.zeros((2, sequence_length), dtype=torch.float32)
+        bounds[0].fill_(start_frac * 2.0 - 1.0)
+        bounds[1].fill_(end_frac * 2.0 - 1.0)
+
+        obj_raw = sample.get("object_feat")
+        mask_raw = sample.get("object_mask")
+        if obj_raw is not None:
+            obj_np = np.asarray(obj_raw, dtype=np.float32)
+            if obj_np.ndim == 1:
+                obj_np = obj_np.reshape(-1, 1)
+            if obj_np.shape[0] != sequence_length:
+                obj_np, _ = video_loader.prepare_feature_sequence(
+                    obj_np,
+                    target_length=sequence_length,
+                    normalize=False,
+                )
+            if object_feature_dim is None:
+                object_feature_dim = obj_np.shape[1]
+            obj_tensor = torch.from_numpy(obj_np)
+
+            if mask_raw is not None:
+                mask_np = np.asarray(mask_raw, dtype=np.float32).reshape(-1, 1)
+                if mask_np.shape[0] != sequence_length:
+                    mask_np, _ = video_loader.prepare_feature_sequence(
+                        mask_np,
+                        target_length=sequence_length,
+                        normalize=False,
+                    )
+                mask_vector = torch.from_numpy(mask_np.reshape(-1))
+            else:
+                mask_vector = (obj_tensor[:, 0] > 0).to(torch.float32)
+
+            object_features.append(obj_tensor)
+            object_masks.append(mask_vector)
+            has_objects = True
+        else:
+            object_features.append(None)
+            object_masks.append(None)
+
+        score_targets.append(scores)
+        bound_targets.append(bounds)
+        metadata.append(
+            {
+                "video_id": sample.get("video_id"),
+                "qid": sample.get("qid"),
+                "start": start_sec,
+                "end": end_sec,
+                "duration": duration,
+            }
+        )
+
+    batch_dict: Dict[str, Any] = {
+        "video_feat": torch.stack(video_tensors),
+        "text_feat": torch.stack(text_tensors),
+        "scores": torch.stack(score_targets),
+        "bounds": torch.stack(bound_targets),
+        "mask": torch.stack(masks),
+        "meta": metadata,
+    }
+
+    if has_objects:
+        feature_dim = object_feature_dim or (object_features[0].shape[1] if object_features[0] is not None else 1)
+        filled_features: List[torch.Tensor] = []
+        filled_masks: List[torch.Tensor] = []
+        for feat, msk in zip(object_features, object_masks):
+            if feat is None:
+                filled_features.append(torch.zeros(sequence_length, feature_dim, dtype=torch.float32))
+            else:
+                filled_features.append(feat.to(torch.float32))
+            if msk is None:
+                filled_masks.append(torch.zeros(sequence_length, dtype=torch.float32))
+            else:
+                filled_masks.append(msk.to(torch.float32))
+
+        batch_dict["object_feat"] = torch.stack(filled_features)
+        batch_dict["object_mask"] = torch.stack(filled_masks)
+
+    return batch_dict
+
+
+def _dataset_iterator(
+    pattern: str,
+    *,
+    batch_size: int,
+    shuffle_buf: int,
+    sequence_length: int,
+    text_tokens: int,
+) -> Iterator[Dict[str, Any]]:
+    pipeline = webdataset_reader.create_pipeline(
+        pattern,
+        batch_size=batch_size,
+        shuffle_buf=shuffle_buf,
+        pin_memory=False,
+    )
+    for batch in pipeline:
+        yield _prepare_sample_batch(
+            batch,
+            sequence_length=sequence_length,
+            text_tokens=text_tokens,
+        )
+
+
 def _synthetic_batches(
     *,
     batch_size: int,
@@ -124,34 +296,10 @@ def _synthetic_batches(
         yield {
             "video_feat": video,
             "text_feat": text,
-            "labels": scores,
+            "scores": scores,
             "bounds": bounds,
             "mask": mask,
         }
-
-
-def _run_epoch(
-    model: torch.nn.Module,
-    data_iter: Iterable[Mapping[str, torch.Tensor]],
-    opt: torch.optim.Optimizer,
-    scaler: amp.Scaler | None,
-    device: torch.device,
-) -> list[MutableMapping[str, float]]:
-    def step_fn(batch: Mapping[str, torch.Tensor]) -> loop.StepOutput:
-        video = batch["video_feat"].to(device)
-        text = batch["text_feat"].to(device)
-        targets = {
-            "scores": batch["labels"].to(device),
-            "bounds": batch["bounds"].to(device),
-        }
-
-        predictions = model(video, text)
-        preds = {"scores": predictions["scores"], "bounds": predictions["bounds"]}
-        loss, components = model.compute_loss(preds, targets)
-        metrics = {key: float(val.detach().item()) for key, val in components.items()}
-        return loop.StepOutput(loss=loss, metrics=metrics)
-
-    return loop.train_epoch(data_iter, step_fn, opt, scaler=scaler)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -170,7 +318,8 @@ def main(argv: list[str] | None = None) -> None:
 
     exp_config = config_utils.load_config(args.config).to_dict()
     model_cfg = exp_config.get("model", {})
-    train_cfg = exp_config.get("train", {})
+    train_cfg = exp_config.get("solver", exp_config.get("train", {}))
+    data_cfg: Mapping[str, Any] = exp_config.get("data", {})
 
     model = _build_model(model_cfg)
 
@@ -191,22 +340,110 @@ def main(argv: list[str] | None = None) -> None:
     scaler = amp.Scaler(enabled=bool(train_cfg.get("fp16", False)))
 
     batch_size = int(train_cfg.get("batch_size", 2))
-    time_steps = int(train_cfg.get("sequence_length", 16))
+    sequence_length = int(train_cfg.get("sequence_length", data_cfg.get("sequence_length", 16)))
+    text_tokens = int(data_cfg.get("text_tokens", args.text_tokens))
     epochs = int(train_cfg.get("epochs", 1))
+    shuffle_buf = int(data_cfg.get("shuffle_buf", 0))
+
+    train_glob = _expand_path(data_cfg.get("shard_glob") or data_cfg.get("train_glob"))
+    def _make_data_iter(pattern: Optional[str], *, shuffle: bool) -> Optional[Iterator[Dict[str, Any]]]:
+        if not pattern:
+            return None
+        return _dataset_iterator(
+            pattern,
+            batch_size=batch_size,
+            shuffle_buf=shuffle_buf if shuffle else 0,
+            sequence_length=sequence_length,
+            text_tokens=text_tokens,
+        )
 
     for epoch in range(epochs):
-        data_iter = _synthetic_batches(
-            batch_size=batch_size,
-            time_steps=time_steps,
-            text_tokens=args.text_tokens,
-            d_v=int(model_cfg.get("d_v", 1024)),
-            d_t=int(model_cfg.get("d_t", 768)),
-            steps=args.steps,
+        train_iter = _make_data_iter(train_glob, shuffle=True)
+        if train_iter is None:
+            data_iter = _synthetic_batches(
+                batch_size=batch_size,
+                time_steps=sequence_length,
+                text_tokens=text_tokens,
+                d_v=int(model_cfg.get("d_v", 1024)),
+                d_t=int(model_cfg.get("d_t", 768)),
+                steps=args.steps,
+            )
+        else:
+            data_iter = train_iter
+
+        def step_fn(batch: Mapping[str, torch.Tensor]) -> loop.StepOutput:
+            video = batch["video_feat"].to(device)
+            text = batch["text_feat"].to(device)
+            mask = batch["mask"].to(device)
+
+            object_tensor: Optional[torch.Tensor] = None
+            object_mask_tensor: Optional[torch.Tensor] = None
+            if "object_feat" in batch:
+                obj = batch["object_feat"].to(device)
+                object_tensor = obj
+                obj_mask = batch.get("object_mask")
+                if obj_mask is not None:
+                    object_mask_tensor = obj_mask.to(device)
+                    object_tensor = object_tensor * object_mask_tensor.unsqueeze(-1)
+            elif hasattr(model, "config") and getattr(model.config, "use_objects", False):
+                object_dim = int(getattr(model.config, "object_dim", 0))
+                if object_dim > 0:
+                    object_tensor = torch.zeros(video.size(0), video.size(1), object_dim, device=device, dtype=video.dtype)
+                    object_mask_tensor = torch.zeros(video.size(0), video.size(1), device=device, dtype=video.dtype)
+
+            use_objects = (
+                object_tensor is not None
+                and hasattr(model, "config")
+                and getattr(model.config, "use_objects", False)
+                and hasattr(model, "object_gate")
+            )
+
+            if use_objects:
+                predictions = model(video, text, object_features=object_tensor)
+            else:
+                predictions = model(video, text)
+            mask_scores = mask.unsqueeze(1)
+            masked_preds = {
+                "scores": predictions["scores"] * mask_scores,
+                "bounds": predictions["bounds"] * mask_scores,
+            }
+            targets = {
+                "scores": batch["scores"].to(device) * mask,
+                "bounds": batch["bounds"].to(device) * mask_scores,
+            }
+
+            loss, components = model.compute_loss(masked_preds, targets)
+            metrics = {key: float(val.detach().item()) for key, val in components.items()}
+            return loop.StepOutput(loss=loss, metrics=metrics)
+
+        history = loop.train_epoch(
+            data_iter,
+            step_fn,
+            opt,
+            scaler=scaler if scaler.enabled else None,
         )
-        history = _run_epoch(model, data_iter, opt, scaler if scaler.enabled else None, device)
         avg_loss = sum(entry["loss"] for entry in history) / max(1, len(history))
         print(f"Epoch {epoch + 1}/{epochs} - loss: {avg_loss:.4f}")
 
+    output_root = Path(os.environ.get("OUTPUT_DIR", "./outputs"))
+    run_name = Path(args.config).stem
+    ckpt_dir = output_root / run_name
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    ckpt_path = ckpt_dir / "model_last.pth"
+    model_to_save = model
+    if hasattr(model_to_save, "_orig_mod"):  # torch.compile wrapper
+        model_to_save = model_to_save._orig_mod  # type: ignore[attr-defined]
+
+    torch.save(
+        {
+            "model_state": model_to_save.state_dict(),
+            "optimizer_state": opt.state_dict(),
+            "scaler_state": scaler.state_dict() if scaler.enabled else {},
+            "config": exp_config,
+        },
+        ckpt_path,
+    )
+    print(f"Saved checkpoint to {ckpt_path}")
 
 if __name__ == "__main__":  # pragma: no cover
     main()

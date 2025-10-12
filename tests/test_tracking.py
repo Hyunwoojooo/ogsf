@@ -21,7 +21,7 @@ def test_tracking_id_persistence_with_occlusion():
         [_det([3, 0, 5, 2], conf=0.9)],
     ]
 
-    config = tracking.TrackerConfig(max_age=2, match_iou_threshold=0.1)
+    config = tracking.TrackerConfig(backend="simple", max_age=2, match_iou_threshold=0.1)
     outputs = tracking.run_tracking(detections, config=config)
 
     track_ids = {record["track_id"] for record in outputs if record["cls"] == 0}
@@ -40,6 +40,7 @@ def test_tracking_interpolates_missing_frames():
     ]
 
     config = tracking.TrackerConfig(
+        backend="simple",
         interpolate_missing=True,
         interpolate_max_gap=2,
         match_iou_threshold=0.0,

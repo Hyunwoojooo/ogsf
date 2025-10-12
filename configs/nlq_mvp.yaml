@@ -1,2 +1,24 @@
-# MVP model experiment configuration placeholder.
-# TODO: Define NLQ MVP training configuration values.
+data:
+  train_glob: "${WDS_SHARDS}/train/*.tar"
+  val_glob: "${WDS_SHARDS}/val/*.tar"
+  shuffle_buf: 128
+  sequence_length: 16
+  text_tokens: 8
+
+model:
+  name: mvp
+  d_v: 512
+  d_t: 512
+  hidden: 256
+  heads: 4
+  num_layers: 2
+  dropout: 0.1
+
+solver:
+  batch_size: 4
+  lr: 2.0e-4
+  epochs: 1
+  fp16: false
+  sequence_length: 16
+
+runtime: {}
