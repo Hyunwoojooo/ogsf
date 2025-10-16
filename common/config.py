@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterator, Mapping
 from copy import deepcopy
 from pathlib import Path
-from typing import Any, Dict, Optional, Type
+from typing import Any, Dict, Optional, Set, Type
 
 try:  # pragma: no cover - optional dependency guard
     import yaml
@@ -38,6 +38,7 @@ class DefaultConfigSchema(BaseModel):
 
     data: Dict[str, Any] = Field(default_factory=dict)
     model: Dict[str, Any] = Field(default_factory=dict)
+    train: Dict[str, Any] = Field(default_factory=dict)
     solver: Dict[str, Any] = Field(default_factory=dict)
     runtime: Dict[str, Any] = Field(default_factory=dict)
 
@@ -75,29 +76,72 @@ class ExperimentConfig(Mapping[str, Any]):
         return self._model
 
 
+def _deep_merge(base: Mapping[str, Any], override: Mapping[str, Any]) -> Dict[str, Any]:
+    """Recursively merge *override* into *base* without mutating inputs."""
+
+    result: Dict[str, Any] = deepcopy(dict(base))
+    for key, value in override.items():
+        if isinstance(value, Mapping) and isinstance(result.get(key), Mapping):
+            result[key] = _deep_merge(result[key], value)  # type: ignore[arg-type]
+        else:
+            result[key] = deepcopy(value)
+    return result
+
+
 def _validate_with_schema(schema_cls: Type[BaseModel], payload: Dict[str, Any]) -> BaseModel:
     if hasattr(schema_cls, "model_validate"):
         return schema_cls.model_validate(payload)  # type: ignore[attr-defined]
     return schema_cls.parse_obj(payload)
 
 
-def load_config(path: str | Path, *, schema: Type[BaseModel] | None = None) -> ExperimentConfig:
+def load_config(
+    path: str | Path,
+    *,
+    schema: Type[BaseModel] | None = None,
+    _stack: Optional[Set[Path]] = None,
+) -> ExperimentConfig:
     """Load a YAML configuration file and validate it with *schema*."""
     schema_cls = schema or DefaultConfigSchema
-    location = Path(path)
+    location = Path(path).resolve()
     if yaml is None:
         raise RuntimeError("PyYAML is required to load configuration files") from YAML_IMPORT_ERROR
+
+    stack = _stack if _stack is not None else set()
+    if location in stack:
+        raise ConfigError(f"Cyclic configuration inheritance detected for {location}")
+    stack.add(location)
 
     try:
         raw_text = location.read_text(encoding="utf-8")
     except OSError as exc:  # pragma: no cover - passthrough read error
+        stack.discard(location)
         raise ConfigLoadError(f"Unable to read configuration: {location}") from exc
 
-    payload: Dict[str, Any] = yaml.safe_load(raw_text) or {}
+    payload_raw: Dict[str, Any] = yaml.safe_load(raw_text) or {}
+
+    inherit_spec = payload_raw.pop("inherit", None)
+    merged_payload: Dict[str, Any] = {}
 
     try:
-        validated = _validate_with_schema(schema_cls, payload)
+        if inherit_spec:
+            inherit_entries = (
+                inherit_spec
+                if isinstance(inherit_spec, (list, tuple))
+                else [inherit_spec]
+            )
+            for entry in inherit_entries:
+                entry_path = Path(entry) if not isinstance(entry, Path) else entry
+                if not entry_path.is_absolute():
+                    entry_path = (location.parent / entry_path).resolve()
+                base_config = load_config(entry_path, schema=schema_cls, _stack=stack)
+                merged_payload = _deep_merge(merged_payload, base_config.to_dict())
+
+        merged_payload = _deep_merge(merged_payload, payload_raw)
+
+        validated = _validate_with_schema(schema_cls, merged_payload)
     except ValidationError as exc:
         raise ConfigValidationError(str(exc)) from exc
+    finally:
+        stack.discard(location)
 
     return ExperimentConfig(validated)

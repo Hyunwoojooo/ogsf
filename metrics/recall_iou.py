@@ -13,6 +13,7 @@ __all__ = [
     "Segment",
     "compute_recall_at_iou",
     "recall_at_k",
+    "average_precision_at_iou",
 ]
 
 
@@ -90,3 +91,69 @@ def recall_at_k(
             max_predictions=k,
         )[iou_threshold]
     return results
+
+
+def average_precision_at_iou(
+    predictions: Sequence[Sequence[Mapping[str, float] | Segment]],
+    ground_truths: Sequence[Sequence[Mapping[str, float] | Segment]],
+    *,
+    iou_threshold: float = 0.5,
+    max_predictions: int | None = 100,
+) -> float:
+    """Compute average precision at a given IoU threshold across the dataset."""
+
+    scores: List[float] = []
+    labels: List[int] = []
+    total_gt = 0
+
+    for pred_list, gt_list in zip(predictions, ground_truths):
+        preds = _prepare_segments(pred_list)
+        if max_predictions is not None:
+            preds = preds[:max_predictions]
+
+        gts = [_to_segment(gt) for gt in gt_list]
+        total_gt += len(gts)
+
+        matched = [False] * len(gts)
+        for pred in preds:
+            best_iou = 0.0
+            best_idx = -1
+            for idx, gt in enumerate(gts):
+                if matched[idx]:
+                    continue
+                current_iou = _iou(pred, gt)
+                if current_iou > best_iou:
+                    best_iou = current_iou
+                    best_idx = idx
+
+            if best_idx >= 0 and best_iou >= iou_threshold:
+                matched[best_idx] = True
+                scores.append(pred.score)
+                labels.append(1)
+            else:
+                scores.append(pred.score)
+                labels.append(0)
+
+    if total_gt == 0 or not scores:
+        return 0.0
+
+    import numpy as np
+
+    order = np.argsort(-np.asarray(scores))
+    labels_sorted = np.asarray(labels)[order]
+
+    tp = np.cumsum(labels_sorted)
+    fp = np.cumsum(1 - labels_sorted)
+
+    recall = tp / max(total_gt, 1)
+    precision = tp / np.maximum(tp + fp, 1e-12)
+
+    mrec = np.concatenate(([0.0], recall, [1.0]))
+    mpre = np.concatenate(([0.0], precision, [0.0]))
+
+    for idx in range(mpre.size - 1, 0, -1):
+        mpre[idx - 1] = max(mpre[idx - 1], mpre[idx])
+
+    indices = np.where(mrec[1:] != mrec[:-1])[0]
+    ap = float(np.sum((mrec[indices + 1] - mrec[indices]) * mpre[indices + 1]))
+    return ap

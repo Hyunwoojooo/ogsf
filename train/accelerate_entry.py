@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional
@@ -309,6 +311,31 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--compile", action="store_true", help="Enable torch.compile where available")
     parser.add_argument("--steps", type=int, default=50, help="Synthetic steps per epoch when data unavailable")
     parser.add_argument("--text-tokens", type=int, default=4, help="Synthetic text token count")
+    parser.add_argument(
+        "--experiment",
+        help="Optional experiment name; defaults to config file stem when omitted",
+    )
+    parser.add_argument(
+        "--device",
+        default="auto",
+        help="Execution device (e.g. cuda, cuda:0, cpu). 'auto' prefers CUDA when available.",
+    )
+    parser.add_argument(
+        "--require-gpu",
+        action="store_true",
+        help="Abort when CUDA is unavailable instead of silently falling back to CPU.",
+    )
+    parser.add_argument(
+        "--log-file",
+        type=Path,
+        help="Optional JSONL file to record per-step training metrics",
+    )
+    parser.add_argument(
+        "--log-interval",
+        type=int,
+        default=1,
+        help="Write every N steps to --log-file (default: 1)",
+    )
     return parser.parse_args(argv)
 
 
@@ -318,7 +345,8 @@ def main(argv: list[str] | None = None) -> None:
 
     exp_config = config_utils.load_config(args.config).to_dict()
     model_cfg = exp_config.get("model", {})
-    train_cfg = exp_config.get("solver", exp_config.get("train", {}))
+    solver_cfg = exp_config.get("solver") or {}
+    train_cfg = solver_cfg or exp_config.get("train", {})
     data_cfg: Mapping[str, Any] = exp_config.get("data", {})
 
     model = _build_model(model_cfg)
@@ -326,7 +354,21 @@ def main(argv: list[str] | None = None) -> None:
     if args.compile and hasattr(torch, "compile"):
         model = torch.compile(model)  # type: ignore[arg-type]
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    def _resolve_device(request: str) -> torch.device:
+        if request == "auto":
+            if torch.cuda.is_available():
+                return torch.device("cuda")
+            return torch.device("cpu")
+        device_candidate = torch.device(request)
+        if device_candidate.type == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError(f"CUDA requested via --device={request} but no CUDA devices are available.")
+        return device_candidate
+
+    device = _resolve_device(args.device)
+    if args.require_gpu and device.type != "cuda":
+        raise RuntimeError("CUDA is required (--require-gpu) but no GPU devices were detected.")
+
+    print(f"[accelerate_entry] using device: {device}")
     model.to(device)
 
     opt_cfg = optimizer.OptimizerConfig(
@@ -356,6 +398,22 @@ def main(argv: list[str] | None = None) -> None:
             sequence_length=sequence_length,
             text_tokens=text_tokens,
         )
+
+    log_handle_fp = None
+    log_writer = None
+    log_every = max(1, int(args.log_interval))
+    if args.log_file:
+        log_path = Path(args.log_file)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_handle_fp = log_path.open("w", encoding="utf-8")
+
+        def _write_log(record: Mapping[str, Any]) -> None:
+            payload = json.dumps(record, ensure_ascii=False)
+            assert log_handle_fp is not None
+            log_handle_fp.write(payload + "\n")
+            log_handle_fp.flush()
+
+        log_writer = _write_log
 
     for epoch in range(epochs):
         train_iter = _make_data_iter(train_glob, shuffle=True)
@@ -425,8 +483,18 @@ def main(argv: list[str] | None = None) -> None:
         avg_loss = sum(entry["loss"] for entry in history) / max(1, len(history))
         print(f"Epoch {epoch + 1}/{epochs} - loss: {avg_loss:.4f}")
 
+        if log_writer is not None:
+            timestamp = time.time()
+            for entry in history:
+                if entry["step"] % log_every != 0:
+                    continue
+                record = dict(entry)
+                record["epoch"] = epoch + 1
+                record["time"] = timestamp
+                log_writer(record)
+
     output_root = Path(os.environ.get("OUTPUT_DIR", "./outputs"))
-    run_name = Path(args.config).stem
+    run_name = args.experiment or Path(args.config).stem
     ckpt_dir = output_root / run_name
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     ckpt_path = ckpt_dir / "model_last.pth"
@@ -444,6 +512,9 @@ def main(argv: list[str] | None = None) -> None:
         ckpt_path,
     )
     print(f"Saved checkpoint to {ckpt_path}")
+
+    if log_handle_fp is not None:
+        log_handle_fp.close()
 
 if __name__ == "__main__":  # pragma: no cover
     main()

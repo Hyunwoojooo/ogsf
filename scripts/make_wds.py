@@ -132,6 +132,7 @@ def _iter_annotations(anno_path: Path) -> Iterator[Dict[str, object]]:
     for video_entry in videos:
         if not isinstance(video_entry, Mapping):
             continue
+        video_uid = video_entry.get("video_uid") or video_entry.get("video_id")
         clips = video_entry.get("clips")
         fps = float(video_entry.get("fps", 30.0))
         if not isinstance(clips, Sequence):
@@ -166,6 +167,11 @@ def _iter_annotations(anno_path: Path) -> Iterator[Dict[str, object]]:
                         "clip_start_sec": query.get("clip_start_sec", query.get("start_sec", query.get("start_time"))),
                         "clip_end_sec": query.get("clip_end_sec", query.get("end_sec", query.get("end_time"))),
                     }
+                    if video_uid:
+                        payload["video_uid"] = str(video_uid)
+                    source_clip_uid = clip.get("source_clip_uid") or clip.get("clip_source_uid")
+                    if source_clip_uid:
+                        payload["source_clip_uid"] = str(source_clip_uid)
                     yield payload
 
 
@@ -343,6 +349,14 @@ def _assemble_samples(
             continue
 
         video_feat = _load_video_feature(feat_dir, clip_uid, cache)
+        if video_feat is None:
+            video_uid = payload.get("video_uid")
+            if isinstance(video_uid, str):
+                video_feat = _load_video_feature(feat_dir, video_uid, cache)
+        if video_feat is None:
+            source_clip_uid = payload.get("source_clip_uid")
+            if isinstance(source_clip_uid, str):
+                video_feat = _load_video_feature(feat_dir, source_clip_uid, cache)
         if video_feat is None:
             print(f"[make_wds] warning: missing video features for {clip_uid}")
             continue

@@ -63,9 +63,12 @@ def _select_pattern(data_cfg: Dict[str, Any], split: str) -> str:
     return expanded
 
 
-def _prepare_outputs(config_path: Path, split: str) -> Dict[str, Path]:
-    output_root = Path(os.environ.get("OUTPUT_DIR", "./outputs"))
-    run_dir = output_root / config_path.stem
+def _prepare_outputs(config_path: Path, split: str, *, output_dir: Path | None) -> Dict[str, Path]:
+    if output_dir is None:
+        output_root = Path(os.environ.get("OUTPUT_DIR", "./outputs"))
+        run_dir = output_root / config_path.stem
+    else:
+        run_dir = output_dir
     run_dir.mkdir(parents=True, exist_ok=True)
 
     submissions_dir = Path("submissions")
@@ -92,13 +95,33 @@ def _format_segments(predictions: Sequence[Dict[str, float]]) -> List[Dict[str, 
 
 
 def main() -> None:
-    args = parse_args()
+    parser = argparse.ArgumentParser(description="Run NLQ inference and metric evaluation.")
+    parser.add_argument("--config", required=True, help="Experiment config YAML path")
+    parser.add_argument("--paths", help="Optional dataset paths YAML")
+    parser.add_argument("--checkpoint", help="Checkpoint to load; defaults to OUTPUT_DIR/<config_name>/model_last.pth")
+    parser.add_argument("--split", choices=["train", "val", "test"], default="val", help="Dataset split to evaluate")
+    parser.add_argument("--batch-size", type=int, help="Batch size for inference (defaults to solver.batch_size)")
+    parser.add_argument("--topk", type=int, default=5, help="Number of proposals to keep per sample (<=0 keeps all)")
+    parser.add_argument("--soft-nms-sigma", type=float, default=0.5, help="Soft-NMS sigma (negative disables Soft-NMS)")
+    parser.add_argument("--iou-threshold", type=float, default=0.5, help="IoU threshold for Recall@K metrics")
+    parser.add_argument("--output-dir", type=Path, help="Optional directory to store predictions/metrics")
+    parser.add_argument(
+        "--device",
+        default="auto",
+        help="Execution device (e.g. cuda, cuda:0, cpu). 'auto' prefers CUDA when available.",
+    )
+    parser.add_argument(
+        "--require-gpu",
+        action="store_true",
+        help="Abort when CUDA is unavailable instead of silently falling back to CPU.",
+    )
+    args = parser.parse_args()
     config_path = Path(args.config)
 
     _load_paths(args.paths)
     exp_config = config_utils.load_config(config_path).to_dict()
     model_cfg = exp_config.get("model", {})
-    solver_cfg = exp_config.get("solver", exp_config.get("train", {}))
+    solver_cfg = exp_config.get("solver") or exp_config.get("train", {})
     data_cfg: Dict[str, Any] = exp_config.get("data", {})
 
     checkpoint_path = _resolve_checkpoint(args, config_path)
@@ -108,7 +131,20 @@ def main() -> None:
     sequence_length = int(solver_cfg.get("sequence_length", data_cfg.get("sequence_length", 16)))
     text_tokens = int(data_cfg.get("text_tokens", 8))
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    def _resolve_device(request: str) -> torch.device:
+        if request == "auto":
+            if torch.cuda.is_available():
+                return torch.device("cuda")
+            return torch.device("cpu")
+        device_candidate = torch.device(request)
+        if device_candidate.type == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError(f"CUDA requested via --device={request} but no CUDA devices were detected.")
+        return device_candidate
+
+    device = _resolve_device(args.device)
+    if args.require_gpu and device.type != "cuda":
+        raise RuntimeError("CUDA is required (--require-gpu) but no GPU devices were detected.")
+    print(f"[infer_nlq] using device: {device}")
 
     model = _build_model(model_cfg)
     state = torch.load(checkpoint_path, map_location="cpu")
@@ -228,7 +264,7 @@ def main() -> None:
                 else:
                     references.append([])
 
-    outputs = _prepare_outputs(config_path, args.split)
+    outputs = _prepare_outputs(config_path, args.split, output_dir=args.output_dir)
 
     prediction_records = []
     for meta, segments in zip(identities, predictions):
@@ -263,6 +299,14 @@ def main() -> None:
         )
         metrics["recall_iou"] = {f"{thr:.2f}": float(val) for thr, val in recall_map.items()}
         metrics["recall_at_k"] = {str(k): float(val) for k, val in recall_k.items()}
+        metrics["map"] = float(
+            recall_iou.average_precision_at_iou(
+                predictions,
+                references,
+                iou_threshold=args.iou_threshold,
+                max_predictions=top_k,
+            )
+        )
 
     outputs["predictions"].write_text(json.dumps(prediction_records, indent=2), encoding="utf-8")
     outputs["metrics"].write_text(json.dumps(metrics, indent=2), encoding="utf-8")
